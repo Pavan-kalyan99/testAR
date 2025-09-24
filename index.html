@@ -26,9 +26,15 @@ html,body{margin:0;padding:0;height:100%;overflow:hidden;font-family:Arial,sans-
 </div>
 
 <script type="module">
-import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
-import { GLTFLoader } from 'https://unpkg.com/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
-import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
+  import * as THREE from 'three';
+
+// import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+  
+// import { GLTFLoader } from 'https://unpkg.com/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
+  import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+// import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
+import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
 
 let camera, scene, renderer, reticle, controller;
 let collectibles=[], score=0, gameStarted=false;
