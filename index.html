@@ -1,225 +1,214 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>WebXR Treasure Hunt</title>
-  <style>
-    html,body{height:100%; margin:0; overflow:hidden; font-family:Arial,Helvetica,sans-serif;}
-    #ui { position: absolute; left: 10px; top: 10px; z-index: 10; color: #fff; }
-    #score { background: rgba(0,0,0,0.5); padding:8px 12px; border-radius:8px; margin-bottom:8px; }
-    #message { background: rgba(0,0,0,0.6); padding:8px 12px; border-radius:8px; max-width: 80vw; }
-    #overlay { position:fixed;top:0;left:0;width:100%;height:100%;
-      background:#000;display:flex;align-items:center;justify-content:center;
-      color:#fff;font-size:1.2em;z-index:20; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Markerless WebAR Game with Drag</title>
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden;font-family:Arial,sans-serif;}
+#overlay{
+  position:fixed;top:0;left:0;width:100%;height:100%;
+  background:#000; display:flex; align-items:center; justify-content:center;
+  color:#fff; font-size:1.2em; z-index:20;
+}
+#ui{
+  position:absolute; top:10px; left:10px; color:#fff; z-index:10; display:none;
+}
+#score{ background:rgba(0,0,0,0.5); padding:8px 12px; border-radius:8px; margin-bottom:8px;}
+#message{ background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:8px; max-width:80vw;}
+</style>
 </head>
 <body>
-  <!-- Loader & error messages -->
-  <div id="overlay">
-    <div id="overlayText">Loading AR…</div>
-  </div>
+<div id="overlay">Loading AR…</div>
+<div id="ui">
+  <div id="score">Score: 0</div>
+  <div id="message"></div>
+</div>
 
-  <!-- Game UI -->
-  <div id="ui" style="display:none;">
-    <div id="score">Score: 0</div>
-    <div id="message"></div>
-  </div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
+import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
 
-  <script type="module">
-  import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
-  import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
+let camera, scene, renderer, reticle, controller;
+let collectibles=[], score=0, gameStarted=false;
+const MAX_COLLECT=5, raycaster=new THREE.Raycaster();
+let selectedObject=null, dragOffset=new THREE.Vector3();
 
-  let camera, scene, renderer, reticle, controller;
-  let collectibles = [], score = 0, gameStarted = false;
-  let hitTestSource = null, hitTestSourceRequested = false;
-  const MAX_COLLECT = 5, raycaster = new THREE.Raycaster();
+const overlay=document.getElementById('overlay');
+const ui=document.getElementById('ui');
+const scoreEl=document.getElementById('score');
+const messageEl=document.getElementById('message');
 
-  const overlay = document.getElementById('overlay');
-  const overlayText = document.getElementById('overlayText');
-  const ui = document.getElementById('ui');
+function showMessage(text,timeout=2400){
+  messageEl.textContent=text;
+  if(timeout>0) setTimeout(()=>{ if(messageEl.textContent===text) messageEl.textContent='';},timeout);
+}
 
-  // Check for WebXR support first
-  if (!('xr' in navigator)) {
-    overlayText.textContent = "❌ WebXR AR not supported on this device/browser.";
-  } else {
-    init();
+if(!('xr' in navigator)){
+  overlay.textContent="❌ WebXR AR not supported on this device/browser.";
+}else{
+  init();
+}
+
+function init(){
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(70,window.innerWidth/window.innerHeight,0.01,20);
+  renderer=new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setSize(window.innerWidth,window.innerHeight);
+  renderer.xr.enabled=true;
+  document.body.appendChild(renderer.domElement);
+
+  const arButton=ARButton.createButton(renderer,{requiredFeatures:['hit-test']});
+  document.body.appendChild(arButton);
+
+  arButton.addEventListener('click',()=>{
+    navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test']})
+      .catch(()=>{ overlay.textContent="⚠️ Failed to start AR session."; });
+  },{once:true});
+
+  const light=new THREE.HemisphereLight(0xffffff,0xbbbbff,1);
+  scene.add(light);
+
+  // Reticle
+  const ringGeo=new THREE.RingGeometry(0.07,0.09,32).rotateX(-Math.PI/2);
+  reticle=new THREE.Mesh(ringGeo,new THREE.MeshBasicMaterial({color:0x00ff99}));
+  reticle.matrixAutoUpdate=false; reticle.visible=false;
+  scene.add(reticle);
+
+  // Controller
+  controller=renderer.xr.getController(0);
+  controller.addEventListener('select', onSelect);
+  controller.addEventListener('selectstart', onDragStart);
+  controller.addEventListener('selectend', onDragEnd);
+  scene.add(controller);
+
+  window.addEventListener('resize', onWindowResize);
+
+  overlay.style.display='none';
+  ui.style.display='block';
+
+  renderer.setAnimationLoop(render);
+}
+
+// Load GLTF collectible model
+async function loadCollectibleModel(){
+  const loader=new GLTFLoader();
+  const gltf=await loader.loadAsync('models/collectible.glb');
+  return gltf.scene;
+}
+
+// Spawn collectibles around reticle
+async function spawnCollectibles(matrix){
+  const origin=new THREE.Vector3(), quat=new THREE.Quaternion(), scale=new THREE.Vector3();
+  matrix.decompose(origin,quat,scale);
+
+  const offsets=[[0.7,0,-0.5],[-1.0,0,-0.8],[0.4,0,0.9],[-0.6,0,1.2],[1.2,0,0.3]];
+  for(let i=0;i<MAX_COLLECT;i++){
+    const pos=new THREE.Vector3(...offsets[i]).applyQuaternion(quat).add(origin);
+    const model=await loadCollectibleModel();
+    model.scale.set(0.1,0.1,0.1);
+    model.position.copy(pos);
+    scene.add(model);
+    collectibles.push(model);
+  }
+}
+
+// Tap to start game or collect
+async function onSelect(){
+  if(!reticle.visible){ showMessage("Point at a surface and tap."); return; }
+
+  if(!gameStarted){
+    gameStarted=true;
+    await spawnCollectibles(reticle.matrix);
+    showMessage(`Game started — collect ${MAX_COLLECT} items!`);
+    return;
   }
 
-  function init() {
-    scene = new THREE.Scene();
-    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+  // Raycast to collectibles
+  const tempMatrix=new THREE.Matrix4(); tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0,0,-1).applyMatrix4(tempMatrix);
 
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.xr.enabled = true;
-    document.body.appendChild(renderer.domElement);
+  const intersects=raycaster.intersectObjects(collectibles,true);
+  if(intersects.length>0){
+    let picked=intersects[0].object;
+    while(picked && !collectibles.includes(picked)) picked=picked.parent;
+    if(picked) collect(picked);
+  } else showMessage("No item at tap point.");
+}
 
-    // AR button
-    const arButton = ARButton.createButton(renderer, {
-      requiredFeatures: ['hit-test']
-    });
-    document.body.appendChild(arButton);
+// Collect object
+function collect(mesh){
+  if(!collectibles.includes(mesh)) return;
+  collectibles=collectibles.filter(m=>m!==mesh);
+  scene.remove(mesh);
+  score++; scoreEl.textContent=`Score: ${score}`;
+  showMessage(`Collected ${score}/${MAX_COLLECT}`);
+  if(score>=MAX_COLLECT) showMessage("You win! 🎉",6000);
+}
 
-    // If session fails to start
-    arButton.addEventListener('click', () => {
-      navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['hit-test'] })
-        .catch(() => {
-          overlay.style.display = 'flex';
-          overlayText.textContent = "⚠️ Failed to start AR session (permission denied or not supported).";
-        });
-    }, { once: true });
+// Drag-to-move interactions
+function onDragStart(){
+  if(!gameStarted) return;
+  const tempMatrix=new THREE.Matrix4();
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0,0,-1).applyMatrix4(tempMatrix);
 
-    // Light
-    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-    scene.add(light);
-
-    // Reticle
-    const ringGeo = new THREE.RingGeometry(0.06, 0.09, 32).rotateX(-Math.PI / 2);
-    reticle = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0x00ff99 }));
-    reticle.matrixAutoUpdate = false;
-    reticle.visible = false;
-    scene.add(reticle);
-
-    // Controller
-    controller = renderer.xr.getController(0);
-    controller.addEventListener('select', onSelect);
-    scene.add(controller);
-
-    window.addEventListener('resize', onWindowResize);
-
-    // Hide loader, show UI
-    overlay.style.display = 'none';
-    ui.style.display = 'block';
-
-    renderer.setAnimationLoop(render);
-  }
-
-  function showMessage(text, timeout=2400){
-    const el = document.getElementById('message');
-    el.textContent = text;
-    if(timeout>0) setTimeout(()=>{ if(el.textContent === text) el.textContent = ''; }, timeout);
-  }
-
-  async function onSelect() {
-    if (!reticle.visible) {
-      showMessage('Point at a flat surface and try again.');
-      return;
+  const intersects=raycaster.intersectObjects(collectibles,true);
+  if(intersects.length>0){
+    let picked=intersects[0].object;
+    while(picked && !collectibles.includes(picked)) picked=picked.parent;
+    if(picked){
+      selectedObject=picked;
+      dragOffset.copy(intersects[0].point).sub(selectedObject.position);
     }
-
-    if (!gameStarted) {
-      // Start game and spawn collectibles
-      gameStarted = true;
-      spawnAroundReticle(reticle.matrix);
-      showMessage(`Game started — collect ${MAX_COLLECT} items!`);
-      return;
-    }
-
-    // Collect logic
-    const tempMatrix = new THREE.Matrix4();
-    tempMatrix.identity().extractRotation(controller.matrixWorld);
-
-    raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
-    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
-
-    const intersects = raycaster.intersectObjects(collectibles, true);
-    if (intersects.length > 0) {
-      let picked = intersects[0].object;
-      while (picked && !collectibles.includes(picked)) picked = picked.parent;
-      if (picked) collect(picked);
-    } else {
-      showMessage('No item at tap point.');
-    }
   }
+}
 
-  function spawnAroundReticle(matrix) {
-    const origin = new THREE.Vector3();
-    const quat = new THREE.Quaternion();
-    const scale = new THREE.Vector3();
-    matrix.decompose(origin, quat, scale);
+function onDragEnd(){ selectedObject=null; }
 
-    const offsets = [
-      [ 0.7, 0, -0.5 ],
-      [ -1.0, 0, -0.8 ],
-      [ 0.4, 0, 0.9 ],
-      [ -0.6, 0, 1.2 ],
-      [ 1.2, 0, 0.3 ],
-    ];
+// WebXR hit-test
+let hitTestSource=null, hitTestSourceRequested=false;
 
-    offsets.slice(0, MAX_COLLECT).forEach( (o,i) => {
-      const v = new THREE.Vector3(o[0], o[1], o[2]).applyQuaternion(quat).add(origin);
-      const geo = new THREE.SphereGeometry(0.06, 16, 12);
-      const mat = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(`hsl(${i*72},80%,55%)`),
-        metalness:0.2, roughness:0.6
+function render(timestamp,frame){
+  if(frame){
+    const session=renderer.xr.getSession();
+    const refSpace=renderer.xr.getReferenceSpace();
+
+    if(!hitTestSourceRequested){
+      session.requestReferenceSpace('viewer').then(vRef=>{
+        session.requestHitTestSource({space:vRef}).then(src=>hitTestSource=src);
       });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(v);
-      mesh.name = `collectible-${i}`;
-      scene.add(mesh);
-      collectibles.push(mesh);
-    });
-  }
-
-  function collect(mesh) {
-    if (!collectibles.includes(mesh)) return;
-    const shrink = setInterval(()=> {
-      mesh.scale.multiplyScalar(0.75);
-      if (mesh.scale.x < 0.02) {
-        clearInterval(shrink);
-        scene.remove(mesh);
-      }
-    }, 70);
-
-    collectibles = collectibles.filter(m => m !== mesh);
-    score++;
-    document.getElementById('score').textContent = `Score: ${score}`;
-    showMessage(`Collected ${score}/${MAX_COLLECT}`);
-
-    if (score >= MAX_COLLECT) {
-      showMessage('You win! 🎉', 6000);
+      session.addEventListener('end',()=>{hitTestSourceRequested=false; hitTestSource=null;});
+      hitTestSourceRequested=true;
     }
-  }
 
-  function render(timestamp, frame) {
-    if (frame) {
-      const session = renderer.xr.getSession();
-      const referenceSpace = renderer.xr.getReferenceSpace();
+    if(hitTestSource){
+      const hits=frame.getHitTestResults(hitTestSource);
+      if(hits.length>0){
+        const pose=hits[0].getPose(refSpace);
+        reticle.visible=true;
+        reticle.matrix.fromArray(pose.transform.matrix);
 
-      if (!hitTestSourceRequested) {
-        session.requestReferenceSpace('viewer').then((viewerRef) => {
-          session.requestHitTestSource({ space: viewerRef }).then((source) => {
-            hitTestSource = source;
-          });
-        });
-        session.addEventListener('end', () => {
-          hitTestSourceRequested = false;
-          hitTestSource = null;
-        });
-        hitTestSourceRequested = true;
-      }
-
-      if (hitTestSource) {
-        const hitTestResults = frame.getHitTestResults(hitTestSource);
-        if (hitTestResults.length > 0) {
-          const hit = hitTestResults[0];
-          const pose = hit.getPose(referenceSpace);
-          reticle.visible = true;
-          reticle.matrix.fromArray(pose.transform.matrix);
-        } else {
-          reticle.visible = false;
+        // Update dragged object along plane
+        if(selectedObject){
+          const planePos=new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+          selectedObject.position.x=planePos.x - dragOffset.x;
+          selectedObject.position.z=planePos.z - dragOffset.z;
         }
-      }
+      } else reticle.visible=false;
     }
-    renderer.render(scene, camera);
   }
+  renderer.render(scene,camera);
+}
 
-  function onWindowResize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-  }
-  </script>
+function onWindowResize(){
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+}
+</script>
 </body>
 </html>
